@@ -16,7 +16,7 @@ import argparse
 import pprint
 
 from data_generator import generate_banana_data
-from DVIB import RegressionDVIB, LambdaCallback
+from DVIB import *
 
 tfd = tfp.distributions
 
@@ -32,60 +32,91 @@ def plot_train_history(train_history: dict) -> None:
     plt.show()
 
 
-def main():
-    (X, Y), (X_test, Y_test) = generate_banana_data(n_sqrt_train, n_sqrt_test, seed=args.seed)
+def load_mnist(download=True):
+    from tensorflow.python.keras.utils.data_utils import get_file
+    origin_folder = 'https://storage.googleapis.com/tensorflow/tf-keras-datasets/'
 
-    # create training and test data set from numpy arrays
-    dataset = tf.data.Dataset.from_tensor_slices((X, Y)).shuffle(n_sqrt_train ** 2).batch(args.mb_size)
-    dataset_test = tf.data.Dataset.from_tensor_slices((X_test, Y_test)).shuffle(n_sqrt_test ** 2).batch(args.mb_size)
+    if download:
+        path = get_file(
+            "mnist.npz",
+            origin=origin_folder + 'mnist.npz',
+            file_hash=
+            '731c5ac602752760c8e48fbffcf8c3b850d9dc2a2aedcf2cc48468fc17b673d1')
+    else:
+        path = "mnist.npz"
+    with np.load(path, allow_pickle=True) as f:
+        if download:
+            np.savez("mnist.npz", **f)
+        x_train, y_train = f['x_train'], f['y_train']
+        x_test, y_test = f['x_test'], f['y_test']
+
+        return (x_train, y_train), (x_test, y_test)
+
+
+def main():
+    (X, Y), (X_test, Y_test) = load_mnist(download=True)
+    # Rescale the images from [0,255] to the [0.0,1.0] range.
+    X, X_test = X[..., np.newaxis] / 255.0, X_test[..., np.newaxis] / 255.0
+
+    # pre-encoding to onehot not necessary anymore, one_hot encoding is done by our models "DVIB.target_transform(y)"
+    # however we will need to pass the depth
+    depth = len(np.unique(Y))
+    # Y, Y_test = tf.one_hot(Y, depth=depth).numpy(), tf.one_hot(Y_test, depth=depth).numpy()
 
     # define the encoder and decoder for our DVIB
-    units = 50
+    units = 512
     activation = 'relu'
     input_shape = X.shape[1:]
-    output_shape = Y.shape[1:]
+    output_shape = (depth,)
 
+    # encoder net will be split into two parts for mu & sd
     encoder_net = keras.Sequential([
         layers.InputLayer(input_shape),  # + np.prod(output_shape)),
-        layers.Dense(units=units, activation=activation),
-        layers.Dense(units=units * 3, activation=activation)
+        layers.Conv2D(filters=64, kernel_size=3, activation=activation),
+        layers.MaxPool2D(),
+        layers.Conv2D(filters=32, kernel_size=3, activation=activation),
+        layers.MaxPool2D(),
+        layers.Conv2D(filters=32, kernel_size=3, activation=activation),
+        layers.Flatten()
     ])
     encoder_mu = keras.Sequential([
-        layers.Dense(units),
         layers.Dense(args.latent_dim)
     ])
     encoder_sd = tf.keras.layers.Dense(units=args.latent_dim,
                                        activation=tf.nn.softplus)
+
     decoder_mu = keras.Sequential(
         [
-            tf.keras.layers.InputLayer((args.latent_dim,)),
-            tf.keras.layers.Dense(units=np.prod(output_shape)),
-            tf.keras.layers.Reshape(output_shape)
+            layers.InputLayer((args.latent_dim,)),
+            layers.Dense(units=units, activation=activation),
+            layers.Dense(units=np.prod(output_shape)),
+            layers.Reshape(output_shape)
         ]
     )
 
-    ib = RegressionDVIB(latent_dim=args.latent_dim,
-                        encoder_net=encoder_net,
-                        encoder_mu=encoder_mu,
-                        encoder_sd=encoder_sd,
-                        decoder_mu=decoder_mu,
-                        starting_lambda=100.)
+    ib = ClassificationDVIB(onehot_depth=depth,
+                            latent_dim=args.latent_dim,
+                            encoder_net=encoder_net,
+                            encoder_mu=encoder_mu,
+                            encoder_sd=encoder_sd,
+                            decoder_mu=decoder_mu,
+                            starting_lambda=20.)
 
     opt = keras.optimizers.Adam(learning_rate=1e-3)
-    ib.compile(optimizer=opt, metrics=["mse"])
-
+    ib.compile(optimizer=opt, metrics=["ACC"])
     # callback for stopping when it gets worse on validation data
     # note that I just used the test set here out of laziness (instead of a proper separate validation data set)
     early_stopping_cb = keras.callbacks.EarlyStopping(monitor="val_expected_ll", patience=10, mode="max",
                                                       restore_best_weights=True)
     # callback for decreasing lambda each x epochs by a factor
-    lambda_cb = LambdaCallback(decrease_lambda_each=5, lambda_factor=0.95)
+    lambda_cb = LambdaCallback(decrease_lambda_each=1, lambda_factor=0.5)
 
     try:
         train_history: dict = ib.fit(x=X, y=Y, epochs=args.num_epochs,
                                      validation_data=(X_test, Y_test),
-                                     validation_freq=5,
-                                     callbacks=[early_stopping_cb, lambda_cb]).history
+                                     validation_freq=3,
+                                     callbacks=[early_stopping_cb, lambda_cb]
+                                     ).history
     except KeyboardInterrupt:
         print("Manually interrupted training..")
         train_history: dict = ib.history.history
@@ -105,37 +136,18 @@ def main():
     # Predict on train and test set with our custom predict_step function.
     # The predict function is called batch-wise, so we can predict on large test sets without doing the loop manually
     y_hat_mu_train, y_hat_sd_train = ib.predict(X)
-    y_hat_mu, y_hat_sd = ib.predict(X_test, batch_size=args.mb_size) # returns shape [-1, mb_size, output_shape]
-    y_hat_mu, y_hat_sd = y_hat_mu.reshape(-1, 1), y_hat_sd.reshape(-1, 1)
-
-    # plot outputs
-    fig, axs = plt.subplots(1, 4)
-    axs[0].imshow(Y.reshape((n_sqrt_train, n_sqrt_train)))
-    axs[0].set_title("Train")
-    axs[1].imshow(Y_test.reshape((n_sqrt_test, n_sqrt_test)))
-    axs[1].set_title("Test")
-    axs[2].imshow(y_hat_mu.reshape((n_sqrt_test, n_sqrt_test)))
-    axs[2].set_title("Predicted")
-    axs[3].imshow((y_hat_mu - Y_test).reshape((n_sqrt_test, n_sqrt_test)))
-    axs[3].set_title("Error")
-    for ax in axs:
-        ax.set_axis_off()
-    plt.show()
+    y_hat_mu, y_hat_sd = ib.predict(X_test, batch_size=16)
+    breakpoint()
 
 
 if __name__ == "__main__":
-    # Parameters for our data set
-    n_sqrt_train = 40
-    n_sqrt_test = 60
-
-    plt.rcParams['image.cmap'] = 'YlGnBu'
     floatType = 'float32'
 
     parser = argparse.ArgumentParser(description="DVIB Demo")
 
-    parser.add_argument("--mb-size", default=400, type=int)
-    parser.add_argument("--latent-dim", default=1, type=int)
-    parser.add_argument("--num-epochs", default=500, type=int)
+    parser.add_argument("--mb-size", default=64, type=int)
+    parser.add_argument("--latent-dim", default=5, type=int)
+    parser.add_argument("--num-epochs", default=50, type=int)
 
     parser.add_argument("--seed", default=1234, type=int)
 
